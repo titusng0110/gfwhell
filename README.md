@@ -1,7 +1,6 @@
 # GFWhell
 
-A secure tunneling solution designed to maintain reliable internet connectivity in restricted network environments (cough, Great Firewall of China, cough). Built with Go, this project demonstrates advanced networking concepts and modern software engineering practices.
-
+A secure tunneling solution designed to obfruscate/mimic HTTP traffic to maintain reliable internet connectivity in restricted network environments (cough, Great Firewall of China, cough).
 ## Overview
 
 GFWhell implements a novel approach to network tunneling by:
