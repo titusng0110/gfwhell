@@ -26,12 +26,6 @@ GFWhell implements a novel approach to network tunneling by:
   - Graceful session management
 - **Security Considerations**: TLS encryption, configurable timeout parameters
 
-## Architecture
-
-The system consists of two main components:
-- **Client**: Listens for local SOCKS5 connections and tunnels traffic to the server
-- **Server**: Handles incoming tunneled connections and forwards traffic to the destination
-
 ## Skills Demonstrated
 
 - Network Protocol Design
