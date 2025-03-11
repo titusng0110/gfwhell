@@ -10,6 +10,10 @@ GFWhell implements a novel approach to network tunneling by:
 - Implementing robust error handling and automatic reconnection
 - Providing seamless integration with SOCKS5 proxies
 
+## Illustration
+![image](https://github.com/user-attachments/assets/e860d663-9863-4e79-81a5-28086b7c0ba5)
+
+
 ## Technical Highlights
 
 - **Advanced Protocol Design**: Bidirectional communication through HTTP(S) using SSE and POST requests
