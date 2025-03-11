@@ -1,6 +1,6 @@
 # GFWhell
 
-A secure tunneling solution designed to obfruscate/mimic HTTP traffic to maintain reliable internet connectivity in restricted network environments (cough, Great Firewall of China, cough).
+A secure tunneling solution designed to obfruscate/mimic HTTPS traffic to maintain reliable internet connectivity in restricted network environments (cough, Great Firewall of China, cough).
 ## Overview
 
 GFWhell implements a novel approach to network tunneling by:
