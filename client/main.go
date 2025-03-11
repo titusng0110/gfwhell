@@ -26,28 +26,59 @@ import (
 // Configuration
 // ======================================================
 const (
-	// Listen for local Socks5 connections.
+	// Listen for local Socks5 connections
 	LocalListenAddr = ":30000"
-	// Remote server URL (your censorship bypass server).
+	// Remote server URL (your censorship bypass server)
 	RemoteServerURL = "https://127.0.0.1:30001"
-	// Maximum size for each POST chunk (4KB).
-	chunkSize = 4 * 1024
-	// Read timeout from the local connection.
-	readTimeout = 30 * time.Second
-	// HTTP client timeout.
-	httpTimeout = 60 * time.Second
-	// Maximum retries for POST requests.
+
+	// Buffer and chunk sizes
+	chunkSize  = 4 * 1024   // Maximum size for each POST chunk (4KB)
+	bufferSize = 128 * 1024 // Size of the local read buffer
+
+	// Timeouts
+	readTimeout = 180 * time.Second // Read timeout from the local connection
+	httpTimeout = 60 * time.Second  // HTTP client timeout
+	dialTimeout = 30 * time.Second  // Connection dial timeout
+	keepAlive   = 60 * time.Second  // TCP keepalive interval
+	idleTimeout = 120 * time.Second // Idle connection timeout
+	tlsTimeout  = 10 * time.Second  // TLS handshake timeout
+
+	// Retry configuration
 	maxRetries     = 3
 	retryBaseDelay = 500 * time.Millisecond
-	// Size of the local read buffer.
-	bufferSize = 32 * 1024
+	reconnectDelay = 500 * time.Millisecond // SSE reconnection delay
+
+	// TLS configuration
+	tlsMinVersion = tls.VersionTLS12
+
+	// Buffer sizes for SSE
+	sseBufferSize = 1024 * 1024 // Use same buffer size for SSE
 )
+
+// User agent strings for request randomization
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+	"Mozilla/5.0 (X11; Linux x86_64)",
+}
+
+var (
+	sseChunks   = make(map[string]*sseChunkBuffer)
+	sseChunksMu sync.Mutex
+)
+
+type sseChunkBuffer struct {
+	total int
+	parts map[int]string // Map chunk number to data.
+}
 
 // ssePayload is the JSON structure already gzipped and base64–encoded
 // that is sent via SSE from the server.
 type ssePayload struct {
-	RequestID string `json:"request_id"`
-	Data      string `json:"data"`
+	RequestID  string `json:"request_id"`
+	Data       string `json:"data"`
+	Part       int    `json:"part,omitempty"`        // New: current part number
+	TotalParts int    `json:"total_parts,omitempty"` // New: total number of parts
 }
 
 // postPayload is the JSON payload sent via POST from client to server.
@@ -140,13 +171,7 @@ func sendChunk(ctx context.Context, client *http.Client, reqID string, part, tot
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// Use a random User-Agent header.
-	uas := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-		"Mozilla/5.0 (X11; Linux x86_64)",
-	}
-	req.Header.Set("User-Agent", uas[rand.Intn(len(uas))])
+	req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 
 	resp, err := client.Do(req)
@@ -202,28 +227,34 @@ var (
 // runSSEReceiver establishes the global SSE connection with the server and
 // dispatches incoming data to the corresponding sessions.
 func runSSEReceiver() {
-	// Create an HTTP client with a reasonable timeout.
-	sseClient = &http.Client{
-		// Timeout: httpTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion:         tls.VersionTLS12,
-				InsecureSkipVerify: true,
-			},
-		},
-	}
-
 	for {
-		err := subscribeSSE() // blocks until error or context cancellation
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					MinVersion:         tlsMinVersion,
+					InsecureSkipVerify: true,
+				},
+				DialContext: (&net.Dialer{
+					Timeout:   dialTimeout,
+					KeepAlive: keepAlive,
+				}).DialContext,
+				ForceAttemptHTTP2:   false,
+				IdleConnTimeout:     idleTimeout,
+				TLSHandshakeTimeout: tlsTimeout,
+			},
+		}
+
+		err := subscribeSSE(client)
 		if err != nil {
-			log.Printf("SSE subscribe error: %v. Reconnecting in 5 seconds...", err)
-			time.Sleep(5 * time.Second)
+			log.Printf("SSE subscribe error: %v. Reconnecting in %v...", err, reconnectDelay)
+			client.Transport.(*http.Transport).CloseIdleConnections()
+			time.Sleep(reconnectDelay)
 		}
 	}
 }
 
 // subscribeSSE connects to the /sse endpoint and dispatches incoming events.
-func subscribeSSE() error {
+func subscribeSSE(client *http.Client) error {
 	url := fmt.Sprintf("%s/sse", RemoteServerURL)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -233,7 +264,7 @@ func subscribeSSE() error {
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Connection", "keep-alive")
 
-	resp, err := sseClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("SSE connection error: %w", err)
 	}
@@ -243,6 +274,7 @@ func subscribeSSE() error {
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, sseBufferSize), sseBufferSize)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -264,6 +296,38 @@ func subscribeSSE() error {
 			log.Printf("SSE JSON unmarshal error: %v", err)
 			continue
 		}
+
+		// If TotalChunks indicates multiple parts, buffer the chunks.
+		if sseMsg.TotalParts > 1 {
+			sseChunksMu.Lock()
+			buf, exists := sseChunks[sseMsg.RequestID]
+			if !exists {
+				buf = &sseChunkBuffer{
+					total: sseMsg.TotalParts,
+					parts: make(map[int]string),
+				}
+				sseChunks[sseMsg.RequestID] = buf
+			}
+			// Save the current chunk.
+			buf.parts[sseMsg.Part] = sseMsg.Data
+
+			// Check if all expected chunks have been received.
+			if len(buf.parts) < buf.total {
+				sseChunksMu.Unlock()
+				continue // Wait for more chunks.
+			}
+			// All chunks received: reassemble in order.
+			var combined string
+			for i := 1; i <= buf.total; i++ {
+				combined += buf.parts[i]
+			}
+			// Remove the buffered entry.
+			delete(sseChunks, sseMsg.RequestID)
+			sseChunksMu.Unlock()
+			// Replace the data with the combined complete message.
+			sseMsg.Data = combined
+		}
+
 		// Get the target session.
 		sessionMu.RLock()
 		sess, ok := sessions[sseMsg.RequestID]
@@ -273,6 +337,7 @@ func subscribeSSE() error {
 			log.Printf("No session for request_id=%s", sseMsg.RequestID)
 			continue
 		}
+
 		// Decode the data: first base64 then gunzip.
 		decoded, err := base64AndGunzip(sseMsg.Data)
 		if err != nil {
@@ -320,66 +385,78 @@ func handleConnection(conn net.Conn, client *http.Client) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Function to read data from the local connection, chunk it and send it.
+	// Start a goroutine to read data from the local connection, chunk it, and send it.
 	go func() {
 		buffer := make([]byte, bufferSize)
-		part := 0
 		for {
+			// Set a deadline for the read.
 			conn.SetReadDeadline(time.Now().Add(readTimeout))
 			n, err := conn.Read(buffer)
 			if n > 0 {
+				// Update the last-activity timestamp.
 				sess.lastActivity = time.Now()
-				// Compress and encode data.
+
+				// Compress and encode the read bytes.
 				encodedStr, err := gzipAndBase64(buffer[:n])
 				if err != nil {
 					log.Printf("gzip/base64 error on session %s: %v", reqID, err)
-					return
+					break
 				}
-				// Calculate chunks.
+
+				// Compute the total number of chunks for the compressed data.
 				totalLen := len(encodedStr)
 				totalChunks := int(math.Ceil(float64(totalLen) / float64(chunkSize)))
-				// When there is data, send each chunk.
+
+				// Send each chunk with its part number and the computed total parts.
 				for i := 0; i < totalChunks; i++ {
-					part++
-					payload := postPayload{}
-					if totalLen > 0 {
-						start := i * chunkSize
-						end := start + chunkSize
-						if end > totalLen {
-							end = totalLen
-						}
-						payload.Data = encodedStr[start:end]
+					start := i * chunkSize
+					end := start + chunkSize
+					if end > totalLen {
+						end = totalLen
 					}
-					// final flag is false here.
-					err = sendChunkWithRetry(ctx, client, reqID, part, 0, payload)
-					if err != nil {
+					payload := postPayload{
+						Data: encodedStr[start:end],
+					}
+					// Use (i+1) as the current chunk number.
+					if err := sendChunkWithRetry(ctx, client, reqID, i+1, totalChunks, payload); err != nil {
 						log.Printf("Error sending data chunk for session %s: %v", reqID, err)
-						return
+						// Exit on error so we eventually send our final chunk
+						goto SEND_FINAL
 					}
 				}
 			}
+
 			if err != nil {
-				// On timeout, continue waiting.
+				log.Printf("Error reading from session %s: %v", reqID, err)
+				// If the error is a timeout, check how long it has been since the last activity.
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if time.Since(sess.lastActivity) > readTimeout {
+						// No activity for an entire readTimeout cycle, so exit the loop.
+						break
+					}
+					// Otherwise, continue waiting.
 					continue
 				}
-				// On EOF or other errors, break the loop.
-				log.Printf("Local connection read error for session %s: %v", reqID, err)
+				// For non-timeout errors (including EOF), exit the read loop.
 				break
 			}
 		}
-		// Send the final (empty) chunk to signal session end.
-		payload := postPayload{Final: true}
-		part++
-		_ = sendChunkWithRetry(ctx, client, reqID, part, part, payload)
-		// Remove the session.
+	SEND_FINAL:
+		// Send the final chunk (an empty body with Final flag set) to signal the end of the session.
+		finalPayload := postPayload{Final: true}
+		if err := sendChunkWithRetry(ctx, client, reqID, 1, 1, finalPayload); err != nil {
+			log.Printf("Error sending final chunk for session %s: %v", reqID, err)
+		}
+
+		// Remove the session from the global sessions map.
 		sessionMu.Lock()
 		delete(sessions, reqID)
 		sessionMu.Unlock()
 		log.Printf("Session %s ended", reqID)
+		cancel() // End the context.
 	}()
 
-	// Block until connection error.
+	// Block until the context is cancelled (this waits for the session goroutine to finish).
 	<-ctx.Done()
 }
 
@@ -387,13 +464,11 @@ func handleConnection(conn net.Conn, client *http.Client) {
 // main() for the client
 // =================================================
 func main() {
-
-	// Create an HTTP client for POST requests.
 	httpClient := &http.Client{
 		Timeout: httpTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				MinVersion:         tls.VersionTLS12,
+				MinVersion:         tlsMinVersion,
 				InsecureSkipVerify: true,
 			},
 		},

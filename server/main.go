@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -23,18 +24,25 @@ import (
 // Configuration
 // ======================================================
 const (
-	// Listen for HTTPS connections.
+	// Network configuration
 	LocalListenAddr = ":30001"
-	// Shadowsocks server address (plain text for this example).
 	ShadowSocksAddr = "127.0.0.1:5080"
-	// Maximum chunk size for SSE events (4 KB).
-	sseChunkSize = 4 * 1024
-	// Write timeout for SSE responses.
-	sseWriteTimeout = 10 * time.Second
 
-	// TLS certificate file paths.
-	tlsCertFile = "server.crt"
-	tlsKeyFile  = "server.key"
+	// Timeouts and intervals
+	readTimeout          = 180 * time.Second      // Read timeout from the local connection
+	sseWriteTimeout      = 10 * time.Second       // Write timeout for SSE responses
+	sessionCleanupDelay  = 100 * time.Millisecond // Delay before closing session
+	sseHeartbeatInterval = 20 * time.Second       // Interval for SSE heartbeat messages
+
+	// Buffer and chunk sizes
+	bufferSize       = 128 * 1024 // Size of the local read buffer (128 KB)
+	sseChunkSize     = 4 * 1024   // Maximum chunk size for SSE events (4 KB)
+	sseChannelBuffer = 100        // Size of the global SSE channel buffer
+
+	// TLS configuration
+	tlsCertFile   = "server.crt"
+	tlsKeyFile    = "server.key"
+	tlsMinVersion = tls.VersionTLS12
 )
 
 // postPayload is the JSON payload sent from client POST requests.
@@ -47,15 +55,17 @@ type postPayload struct {
 
 // ssePayload is the JSON structure sent to the client in SSE.
 type ssePayload struct {
-	RequestID string `json:"request_id"`
-	Data      string `json:"data"`
+	RequestID  string `json:"request_id"`
+	Data       string `json:"data"`
+	Part       int    `json:"part,omitempty"`        // New: current part number (1-indexed)
+	TotalParts int    `json:"total_parts,omitempty"` // New: total number of parts
 }
 
 // ======================================================
 // Global SSE channel and connection control
 // ======================================================
 var (
-	globalSSEChan      = make(chan string, 100)
+	globalSSEChan      = make(chan string, sseChannelBuffer)
 	globalSSEMu        sync.Mutex
 	globalSSEConnected bool
 )
@@ -66,15 +76,13 @@ var (
 
 // Session bridges data between the client (via POST) and Shadowsocks.
 type Session struct {
-	RequestID string
-	// Conn to Shadowsocks.
-	Conn net.Conn
-	// Protect writes to Shadowsocks connection.
-	writeMutex sync.Mutex
-	// cancel cancels behind–the–scene routines.
-	cancel context.CancelFunc
-	closed bool
-	mu     sync.Mutex
+	RequestID     string
+	Conn          net.Conn
+	writeMutex    sync.Mutex
+	cancel        context.CancelFunc
+	closed        bool
+	mu            sync.Mutex
+	collectedData string // New field for accumulating base64 encoded chunks
 }
 
 // Global sessions indexed by request id.
@@ -143,7 +151,7 @@ func (s *Session) closeSession() {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(sessionCleanupDelay)
 	if s.Conn != nil {
 		s.Conn.Close()
 	}
@@ -155,7 +163,7 @@ func (s *Session) closeSession() {
 func (s *Session) startSession(ctx context.Context) {
 	go func() {
 		defer s.closeSession() // Clean up on exit.
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, bufferSize)
 		for {
 			select {
 			case <-ctx.Done():
@@ -163,7 +171,7 @@ func (s *Session) startSession(ctx context.Context) {
 			default:
 			}
 			// Set a read deadline.
-			s.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			s.Conn.SetReadDeadline(time.Now().Add(readTimeout))
 			n, err := s.Conn.Read(buf)
 			if err != nil {
 				if !errors.Is(err, io.EOF) &&
@@ -177,56 +185,54 @@ func (s *Session) startSession(ctx context.Context) {
 			if n <= 0 {
 				continue
 			}
-			encoded, err := gzipAndBase64(buf[:n])
+			// Compress and encode the read data.
+			encodedStr, err := gzipAndBase64(buf[:n])
 			if err != nil {
 				log.Printf("Error encoding data for session %s: %v", s.RequestID, err)
 				continue
 			}
-			// Pack payload into a JSON object with request ID.
-			sseObj := ssePayload{
-				RequestID: s.RequestID,
-				Data:      encoded,
-			}
-			jsonData, err := json.Marshal(sseObj)
-			if err != nil {
-				log.Printf("Error marshaling SSE payload for session %s: %v", s.RequestID, err)
-				continue
-			}
-			// Send JSON string on the global SSE channel.
-			select {
-			case globalSSEChan <- string(jsonData):
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("Warning: SSE channel full, dropping message for session %s", s.RequestID)
-			}
-		}
-	}()
 
-	// Heartbeat goroutine to keep the SSE connection alive.
-	go func() {
-		ticker := time.NewTicker(20 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
+			// Calculate total number of chunks based on sseChunkSize.
+			totalLen := len(encodedStr)
+			totalChunks := int(math.Ceil(float64(totalLen) / float64(sseChunkSize)))
+
+			// Send each chunk as a separate SSE message.
+			for i := 0; i < totalChunks; i++ {
+				start := i * sseChunkSize
+				end := start + sseChunkSize
+				if end > totalLen {
+					end = totalLen
+				}
+				chunkData := encodedStr[start:end]
+				sseObj := ssePayload{
+					RequestID:  s.RequestID,
+					Data:       chunkData,
+					Part:       i + 1, // 1-indexed chunk number
+					TotalParts: totalChunks,
+				}
+				jsonData, err := json.Marshal(sseObj)
+				if err != nil {
+					log.Printf("Error marshaling SSE payload for session %s: %v", s.RequestID, err)
+					continue
+				}
+				// Send JSON string on the global SSE channel.
 				select {
-				case globalSSEChan <- "heartbeat":
+				case globalSSEChan <- string(jsonData):
+				case <-ctx.Done():
+					return
 				default:
-					log.Printf("Warning: SSE channel full while sending heartbeat")
+					log.Printf("Warning: SSE channel full, dropping message for session %s", s.RequestID)
 				}
 			}
 		}
 	}()
+
 }
 
 // ======================================================
 // HTTP Handlers
 // ======================================================
-
-// uploadHandler handles POST /upload requests.
+// uploadHandler handles POST /upload requests and collects all chunks before decoding.
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -238,10 +244,19 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	requestID := q.Get("requestid")
 	partStr := q.Get("part")
 	totalPartStr := q.Get("totalpart")
-	part, _ := strconv.Atoi(partStr)
-	totalPart, _ := strconv.Atoi(totalPartStr)
-	log.Printf("Received upload: request_id=%s, part=%d, totalPart=%d", requestID, part, totalPart)
+	part, err := strconv.Atoi(partStr)
+	if err != nil {
+		http.Error(w, "Invalid part parameter", http.StatusBadRequest)
+		return
+	}
+	totalPart, err := strconv.Atoi(totalPartStr)
+	if err != nil {
+		http.Error(w, "Invalid totalpart parameter", http.StatusBadRequest)
+		return
+	}
+	// log.Printf("Received upload: request_id=%s, part=%d, totalPart=%d", requestID, part, totalPart)
 
+	// Decode the JSON body.
 	var payload postPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -249,7 +264,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Get or create a session.
+	// Retrieve or create the session.
 	sess := getSession(requestID)
 	if sess == nil {
 		conn, err := net.Dial("tcp", ShadowSocksAddr)
@@ -260,43 +275,66 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		sess = &Session{
-			RequestID: requestID,
-			Conn:      conn,
-			cancel:    cancel,
+			RequestID:     requestID,
+			Conn:          conn,
+			cancel:        cancel,
+			collectedData: "", // Initialize accumulator.
 		}
 		addSession(sess)
-		sess.startSession(ctx)
+		// Optionally, start any session-related goroutines.
+		go sess.startSession(ctx)
 		log.Printf("Created new session for request_id=%s", requestID)
 	}
 
-	// If payload includes data, decode and forward it to Shadowsocks.
+	// If the final flag is set, close the session.
+	if payload.Final {
+		go sess.closeSession()
+		log.Printf("Final chunk received for session %s, session closed", requestID)
+	}
+
+	// Append any provided data chunk to the session's accumulator.
 	if payload.Data != "" {
-		data, err := base64AndGunzip(payload.Data)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Data decode error: %v", err), http.StatusBadRequest)
-			log.Printf("Decode error for session %s: %v", requestID, err)
-			return
-		}
-		sess.writeMutex.Lock()
-		_, err = sess.Conn.Write(data)
-		sess.writeMutex.Unlock()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error writing to Shadowsocks: %v", err), http.StatusInternalServerError)
-			log.Printf("Error writing to Shadowsocks for session %s: %v", requestID, err)
-			return
-		}
-		log.Printf("Forwarded %d bytes for session %s", len(data), requestID)
+		sess.mu.Lock()
+		sess.collectedData += payload.Data
+		sess.mu.Unlock()
+		// log.Printf("Accumulated chunk for session %s: received %d bytes", requestID, len(payload.Data))
 	} else {
 		log.Printf("Received heartbeat/empty chunk for session %s", requestID)
 	}
 
-	// If final chunk, close the session.
-	if payload.Final {
-		go sess.closeSession()
-		log.Printf("Final chunk received for session %s", requestID)
+	if part == totalPart {
+		// Retrieve all collected data.
+		sess.mu.Lock()
+		dataStr := sess.collectedData
+		sess.mu.Unlock()
+
+		if dataStr != "" {
+			// Decode and decompress the entire collected data.
+			data, err := base64AndGunzip(dataStr)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Data decode error: %v", err), http.StatusBadRequest)
+				log.Printf("Decode error for session %s: %v", requestID, err)
+				return
+			}
+
+			// Write the decompressed data to the Shadowsocks connection.
+			sess.writeMutex.Lock()
+			_, err = sess.Conn.Write(data)
+			sess.writeMutex.Unlock()
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error writing to Shadowsocks: %v", err), http.StatusInternalServerError)
+				log.Printf("Error writing to Shadowsocks for session %s: %v", requestID, err)
+				return
+			}
+			// log.Printf("Forwarded decompressed data for session %s, total bytes: %d", requestID, len(data))
+			sess.mu.Lock()
+			sess.collectedData = ""
+			sess.mu.Unlock()
+		}
+
 	}
 
-	// Always return 200 OK (empty response).
+	// Always return a 200 OK response.
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
@@ -345,18 +383,16 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	for {
 		select {
-		case msg := <-globalSSEChan:
-			// Handle heartbeat.
-			if msg == "heartbeat" {
-				_, err := w.Write([]byte("data: heartbeat\n\n"))
-				if err != nil {
-					log.Printf("Error writing SSE heartbeat: %v", err)
-					return
-				}
-				flusher.Flush()
-				continue
-			}
+		case <-ctx.Done():
+			log.Printf("SSE connection closed by client")
+			// clear all messages in the channel
+			for len(globalSSEChan) > 0 {
+				<-globalSSEChan
+				// clear all sessions and close them
 
+			}
+			return
+		case msg := <-globalSSEChan:
 			// Write the message.
 			sseMsg := fmt.Sprintf("data: %s\n\n", strings.TrimSpace(msg))
 			// Set a write deadline.
@@ -369,10 +405,15 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
+		// Handle a heartbeat message.
+		case <-time.After(sseHeartbeatInterval):
+			_, err := w.Write([]byte("data: heartbeat\n\n"))
+			if err != nil {
+				log.Printf("Error writing SSE heartbeat: %v", err)
+				return
+			}
+			flusher.Flush()
 
-		case <-ctx.Done():
-			log.Printf("SSE connection closed by client")
-			return
 		}
 	}
 }
@@ -392,7 +433,7 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 
 	tlsConfig := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
+		MinVersion:         tlsMinVersion,
 		InsecureSkipVerify: true,
 	}
 
